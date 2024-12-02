@@ -1,0 +1,179 @@
+import os
+from riotwatcher import LolWatcher, ApiError
+import time
+from collections import Counter
+import math
+
+# Ensure you have the 'discord-webhook' installed if you plan to send Discord notifications
+# pip install discord-webhook
+
+# Optional: For Discord Notifications
+# from discord_webhook import DiscordWebhook
+
+API_KEY = 'RGAPI-683e5dff-ff66-4a41-b5a5-ad8b0d8b42ba'  # Replace with your Riot API key
+watcher = LolWatcher(API_KEY)
+region = 'americas'  # For TFT, region is typically 'americas'
+
+# Optional: Discord Webhook URL for Notifications
+# DISCORD_WEBHOOK_URL = 'your_discord_webhook_url'
+
+def exponential_backoff_retry(func, max_retries=5, *args, **kwargs):
+    for n in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except ApiError as err:
+            if err.response.status_code == 429:
+                retry_after = int(err.response.headers.get('Retry-After', 1))
+                sleep_time = math.pow(2, n) * retry_after
+                print(f"Rate limit hit. Retrying in {sleep_time} seconds.")
+                time.sleep(sleep_time)
+            else:
+                print(f"API Error: {err}")
+                break
+    return None
+
+def fetch_high_ranked_summoners(tier):
+    try:
+        league = exponential_backoff_retry(watcher.league.by_queue, queue='RANKED_TFT', tier=tier)
+        if league is None:
+            return []
+        # For Master, Grandmaster, Challenger, there are no divisions
+        summoners = [entry['summonerId'] for entry in league]
+        print(f"Fetched {len(summoners)} Summoners from {tier}.")
+        return summoners
+    except Exception as err:
+        print(f"Error fetching league data for tier {tier}: {err}")
+        return []
+
+def get_recent_matches(puuid, count=20):
+    try:
+        matches = exponential_backoff_retry(watcher.match.matchlist_by_puuid, region='americas', puuid=puuid, count=count, queue='1090')
+        if matches is None:
+            return []
+        return matches
+    except Exception as err:
+        print(f"Error fetching match history for PUUID {puuid}: {err}")
+        return []
+
+def extract_unit_composition(match_id, puuid):
+    try:
+        match = exponential_backoff_retry(watcher.match.by_id, region='americas', match_id=match_id)
+        if match is None:
+            return []
+        participants = match['info']['participants']
+        for participant in participants:
+            if participant['puuid'] == puuid:
+                units = participant.get('units', [])
+                unit_names = sorted([unit['character_id'] for unit in units])
+                return unit_names
+        return []
+    except Exception as err:
+        print(f"Error fetching match data for match ID {match_id}: {err}")
+        return []
+
+def identify_onetrick(puuid, threshold=0.7, match_count=10):
+    matches = get_recent_matches(puuid, count=match_count)
+    if not matches:
+        return None
+    compositions = []
+    for match_id in matches:
+        units = extract_unit_composition(match_id, puuid)
+        if units:
+            compositions.append(tuple(units))
+        time.sleep(1)  # Respect rate limits
+    if not compositions:
+        return None
+    composition_counts = Counter(compositions)
+    most_common_composition, count = composition_counts.most_common(1)[0]
+    consistency = count / len(compositions)
+    if consistency >= threshold:
+        return most_common_composition
+    else:
+        return None
+
+def find_onetricks(summoner_ids, threshold=0.7, match_count=10):
+    onetricks = {}
+    for summoner_id in summoner_ids:
+        try:
+            summoner = exponential_backoff_retry(watcher.summoner.by_id, region, summoner_id=summoner_id)
+            if summoner is None:
+                continue
+            puuid = summoner['puuid']
+            composition = identify_onetrick(puuid, threshold, match_count)
+            if composition:
+                onetricks[summoner['name']] = composition
+                print(f"Onetrick found: {summoner['name']} with composition {composition}")
+                # Optional: Save to Database or Cache
+            else:
+                print(f"{summoner['name']} does not qualify as an onetrick.")
+            # Pause to respect rate limits
+            time.sleep(1)
+        except ApiError as err:
+            print(f"Error processing summoner ID {summoner_id}: {err}")
+    return onetricks
+
+def is_in_game(summoner_id):
+    try:
+        current_game = exponential_backoff_retry(watcher.spectator.by_summoner, region, summoner_id=summoner_id)
+        if current_game:
+            return True, current_game
+        else:
+            return False, None
+    except ApiError as err:
+        if err.response.status_code == 404:
+            return False, None
+        else:
+            print(f"An error occurred: {err}")
+            return False, None
+
+# Optional: Discord Notification Function
+# def send_discord_notification(message):
+#     webhook = DiscordWebhook(url=DISCORD_WEBHOOK_URL, content=message)
+#     webhook.execute()
+
+def monitor_onetricks(onetricks, check_interval=60):
+    while True:
+        print(f"\nMonitoring Onetricks at {time.strftime('%Y-%m-%d %H:%M:%S')}:")
+        for name, composition in onetricks.items():
+            try:
+                summoner = exponential_backoff_retry(watcher.summoner.by_name, region, summoner_name=name)
+                if summoner is None:
+                    continue
+                in_game, game_info = is_in_game(summoner['id'])
+                status = "In Game" if in_game else "Not In Game"
+                print(f"{name} ({', '.join(composition)}): {status}")
+                if in_game:
+                    # Implement notification logic here
+                    print(f"--> {name} is currently in a game!")
+                    # Optional: Send Discord Notification
+                    # message = f"{name} is currently in a game with composition: {', '.join(composition)}"
+                    # send_discord_notification(message)
+            except ApiError as err:
+                print(f"Error checking game status for {name}: {err}")
+            # Pause to respect rate limits
+            time.sleep(1)
+        time.sleep(check_interval)
+
+def main():
+    # Step 1: Fetch High-Ranked Summoners
+    tiers = ['MASTER', 'GRANDMASTER', 'CHALLENGER']  # Target high tiers only
+    all_summoners = []
+    for tier in tiers:
+        summoners = fetch_high_ranked_summoners(tier)
+        all_summoners.extend(summoners)
+        time.sleep(1)  # Respect rate limits
+
+    print(f"Total high-ranked summoners fetched: {len(all_summoners)}")
+
+    # Step 2: Identify Onetricks
+    onetrick_players = find_onetricks(all_summoners, threshold=0.7, match_count=10)
+    print(f"Total onetricks identified: {len(onetrick_players)}")
+
+    if onetrick_players:
+        # Step 3: Monitor Onetricks' In-Game Status
+        monitor_onetricks(onetrick_players, check_interval=60)
+    else:
+        print("No onetricks identified. Exiting.")
+
+if __name__ == "__main__":
+    main()
